@@ -53,6 +53,12 @@
                         (str/starts-with? tool-scope prefix))))
                   token-scopes)))))
 
+(def ^:private empty-input-schema
+  "Fallback inputSchema for tools that accept no parameters. MCP requires inputSchema
+   to be a JSON Schema object; serializing nil → \"inputSchema\":null causes some
+   clients (notably Cursor) to reject the entire tools list."
+  {:type "object" :properties {}})
+
 (defn list-tools
   "Return the tool definitions suitable for MCP `tools/list` responses.
    When `token-scopes` is provided, only tools whose scope matches are included."
@@ -63,7 +69,7 @@
                 (map (fn [tool]
                        {:name        (:name tool)
                         :description (:description tool)
-                        :inputSchema (:inputSchema tool)})))
+                        :inputSchema (or (:inputSchema tool) empty-input-schema)})))
           tools)))
 
 (defn- build-tool-index
