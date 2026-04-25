@@ -266,12 +266,12 @@
         (is (= (mt/id) (lib/database-id decoded)))
         (is (= (mt/id :orders) (lib/primary-source-table-id decoded))))))
 
-  (testing "Applies default limit of 200 when no limit is specified"
+  (testing "Applies default limit of 500 when no limit is specified"
     (let [table-id (mt/id :orders)
           response (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
                                          {:table_id table-id})
           decoded  (decode-query response)]
-      (is (= 200 (lib/current-limit decoded)))))
+      (is (= 500 (lib/current-limit decoded)))))
 
   (testing "Respects explicit limit"
     (let [table-id (mt/id :orders)
@@ -308,10 +308,10 @@
     (let [table-id       (mt/id :orders)
           construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
                                                {:table_id table-id
-                                                :limit    300})
+                                                :limit    600})
           execute-resp   (mt/user-http-request :rasta :post 202 "agent/v1/execute"
                                                {:query (:query construct-resp)})]
-      (is (=? {:status "completed" :row_count 200}
+      (is (=? {:status "completed" :row_count 500}
               execute-resp)))))
 
 (deftest get-metric-field-values-test
@@ -432,8 +432,8 @@
   (testing "Continuation token returns next page of results when the total limit exceeds the page size"
     (let [table-id   (mt/id :orders)
           field-id   (visible-field-id table-id "ID")
-          page-size  200
-          total-rows 250
+          page-size  500
+          total-rows 600
           page1      (mt/user-http-request :rasta :post 202 "agent/v1/query"
                                            {:table_id table-id
                                             :order_by [{:field {:field_id field-id} :direction "asc"}]
@@ -459,9 +459,9 @@
                                   {:table_id     (mt/id :orders)
                                    :aggregations [{:function "count"}]}))))
 
-  (testing "Per-page cap limits a single page to 200 rows even when the total limit is higher"
+  (testing "Per-page cap limits a single page to 500 rows even when the total limit is higher"
     (is (=? {:status    "completed"
-             :row_count (fn [n] (<= n 200))}
+             :row_count (fn [n] (<= n 500))}
             (mt/user-http-request :rasta :post 202 "agent/v1/query"
                                   {:table_id (mt/id :orders)
                                    :limit    1000})))))
@@ -509,3 +509,130 @@
                    :total_count 1}
                   (mt/user-http-request :rasta :post 200 "agent/v1/search"
                                         {:term_queries ["AgentSearchTestMetric"]}))))))))
+
+;;; ------------------------------------------------- Card & Database Tools ------------------------------------------
+
+(deftest search-cards-test
+  (binding [search.ingestion/*force-sync* true]
+    (search.tu/with-new-search-if-available-otherwise-legacy
+      (mt/with-temp [:model/Card _q {:name          "AgentSearchCardsQuestion"
+                                     :type          :question
+                                     :database_id   (mt/id)
+                                     :dataset_query (orders-count-query)}
+                     :model/Card _m {:name          "AgentSearchCardsModel"
+                                     :type          :model
+                                     :database_id   (mt/id)
+                                     :dataset_query (orders-count-query)}]
+        (testing "Returns saved questions matching a term query"
+          (is (=? {:data        [{:type "question" :name "AgentSearchCardsQuestion"}]
+                   :total_count 1}
+                  (mt/user-http-request :rasta :post 200 "agent/v1/search/cards"
+                                        {:term_queries ["AgentSearchCardsQuestion"]}))))
+        (testing "Returns models with type=\"model\""
+          (is (=? {:data        [{:type "model" :name "AgentSearchCardsModel"}]
+                   :total_count 1}
+                  (mt/user-http-request :rasta :post 200 "agent/v1/search/cards"
+                                        {:term_queries ["AgentSearchCardsModel"]}))))))))
+
+(deftest list-databases-test
+  (testing "Returns databases the user can query, with native_permissions"
+    (let [response (mt/user-http-request :rasta :get 200 "agent/v1/database")]
+      (is (=? {:data        sequential?
+               :total_count pos-int?}
+              response))
+      (let [app-db (first (filter #(= (:id %) (mt/id)) (:data response)))]
+        (is (some? app-db) "The test database should be visible")
+        (is (contains? #{"write" "none"} (:native_permissions app-db)))
+        (is (string? (:name app-db)))
+        (is (string? (:engine app-db)))))))
+
+(deftest get-card-test
+  (mt/with-temp [:model/Card {card-id :id}
+                 {:name          "AgentGetCardTestQuestion"
+                  :type          :question
+                  :database_id   (mt/id)
+                  :dataset_query (orders-count-query)}]
+    (testing "Returns card details for an MBQL question"
+      (is (=? {:id         card-id
+               :type       "question"
+               :name       "AgentGetCardTestQuestion"
+               :query_type "query"
+               :parameters []}
+              (mt/user-http-request :crowberto :get 200 (str "agent/v1/card/" card-id)))))
+
+    (testing "Non-existent card returns 404"
+      (is (= "Not found."
+             (mt/user-http-request :crowberto :get 404 "agent/v1/card/999999"))))))
+
+(deftest get-card-native-query-test
+  (let [native-query {:type     :native
+                      :database (mt/id)
+                      :native   {:query         "SELECT count(*) AS c FROM {{tbl}}"
+                                 :template-tags {"tbl" {:name         "tbl"
+                                                        :display-name "Table"
+                                                        :type         :text
+                                                        :required     true}}}}]
+    (mt/with-temp [:model/Card {card-id :id}
+                   {:name          "AgentGetCardTestNative"
+                    :type          :question
+                    :database_id   (mt/id)
+                    :dataset_query native-query}]
+      (testing "Native SQL is returned for a user with native query perms"
+        (is (=? {:id         card-id
+                 :query_type "native"
+                 :native_query "SELECT count(*) AS c FROM {{tbl}}"
+                 :native_template_tags [{:name         "tbl"
+                                         :display_name "Table"
+                                         :type         "text"
+                                         :required     true}]}
+                (mt/user-http-request :crowberto :get 200 (str "agent/v1/card/" card-id))))))))
+
+(deftest execute-card-test
+  (mt/with-temp [:model/Card {card-id :id}
+                 {:name          "AgentExecuteCardTest"
+                  :type          :question
+                  :database_id   (mt/id)
+                  :dataset_query (orders-count-query)}]
+    (testing "Executes a saved question and returns results"
+      (is (=? {:status    "completed"
+               :row_count pos?
+               :data      {:cols (fn [cols] (seq cols))
+                           :rows (fn [rows] (seq rows))}}
+              (mt/user-http-request :rasta :post 202 (str "agent/v1/card/" card-id "/execute") {}))))))
+
+(deftest execute-native-query-test
+  (testing "Executes a native query for a user with native query perms"
+    (is (=? {:status    "completed"
+             :row_count 1
+             :data      {:rows [[1]]}}
+            (mt/user-http-request :crowberto :post 202 "agent/v1/native"
+                                  {:database_id (mt/id)
+                                   :sql         "SELECT 1"}))))
+
+  (testing "Rejects native query when the user lacks adhoc native perms"
+    (mt/with-no-data-perms-for-all-users!
+      (mt/user-http-request :rasta :post 403 "agent/v1/native"
+                            {:database_id (mt/id)
+                             :sql         "SELECT 1"}))))
+
+(deftest get-card-parameter-values-test
+  (mt/with-temp
+    [:model/Card {card-id :id}
+     {:name          "AgentCardParamValuesTest"
+      :type          :question
+      :database_id   (mt/id)
+      :dataset_query {:type     :query
+                      :database (mt/id)
+                      :query    {:source-table (mt/id :venues)}}
+      :parameters    [{:id                   "_STATIC_CATEGORY_"
+                       :name                 "Static Category"
+                       :slug                 "static_category"
+                       :type                 "category"
+                       :values_source_type   "static-list"
+                       :values_source_config {:values ["African" "American" "Asian"]}}]}]
+    (testing "Returns the configured static values for the parameter"
+      (let [response (mt/user-http-request :crowberto :get 200
+                                           (str "agent/v1/card/" card-id "/params/_STATIC_CATEGORY_/values"))]
+        (is (contains? response :values))
+        (is (= #{"African" "American" "Asian"}
+               (set (map first (:values response)))))))))

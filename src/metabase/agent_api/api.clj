@@ -18,7 +18,12 @@
    [metabase.metabot.tools.filters :as metabot-filters]
    [metabase.metabot.tools.search :as metabot-search]
    [metabase.metabot.util :as metabot.u]
+   [metabase.models.interface :as mi]
+   [metabase.permissions.core :as perms]
+   [metabase.queries.core :as queries]
+   [metabase.query-processor.card :as qp.card]
    [metabase.query-processor.core :as qp]
+   [metabase.query-processor.middleware.permissions :as qp.perms]
    [metabase.query-processor.streaming :as qp.streaming]
    [metabase.request.core :as request]
    [metabase.server.streaming-response :as streaming-response]
@@ -36,13 +41,15 @@
   30)
 
 (def ^:private ^:const default-query-row-limit
-  "Default row cap when :limit is omitted from a table query request."
-  200)
+  "Default row cap when :limit is omitted from a table query request.
+   All rows are streamed back into the LLM context, so keep this tight enough that a
+   single tool response stays well under model context limits."
+  500)
 
 (def ^:private ^:const page-size
   "Rows returned per page when paginating the combined query endpoint via continuation tokens.
    Also used as the query processor's per-call row constraint."
-  200)
+  500)
 
 (def ^:private ^:const max-total-row-limit
   "Ceiling on the user-requested :limit for the combined query endpoint. Agents can paginate
@@ -805,7 +812,7 @@
   - On success: {:data {:cols [...] :rows [...]} :row_count N :status :completed :running_time M}
   - On failure: {:status :failed :error \"message\" ...}
 
-  Agent query row limits are enforced (200 rows per request)."
+  Agent query row limits are enforced (500 rows per request)."
   {:scope "agent:query:execute"
    :tool  {:name "execute_query"
            :description "Execute a previously constructed query and return the results with column metadata, row count, and execution time."}}
@@ -817,6 +824,377 @@
                   json/decode+kw)]
     (qp.streaming/streaming-response [rff :api]
       (qp/process-query (prepare-combined-query query) rff))))
+
+;;; ------------------------------------------------ Cards & Databases ------------------------------------------------
+;;
+;; These tools expose saved questions ("cards"), their parameters, and ad-hoc native SQL execution,
+;; so MCP clients can automate workflows already built inside Metabase. Access is fully governed by
+;; Metabase's existing user permissions — the agent API only enforces its own scope layer, then
+;; delegates every read/check to `mi/can-read?`, `api/read-check`, and the QP's permission
+;; middleware (notably `qp.perms/check-current-user-has-adhoc-native-query-perms` for native).
+
+;;; Schemas ---------------------------------------------------------------------------------------
+
+(mr/def ::card-collection
+  "Summary of the collection a card lives in."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:id              {:optional true} [:maybe :int]]
+   [:name            {:optional true} [:maybe :string]]
+   [:authority_level {:optional true} [:maybe :string]]])
+
+(mr/def ::card-summary
+  "A card (saved question or model) returned from search_cards."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:id :int]
+   [:type [:enum "question" "model"]]
+   [:name :string]
+   [:description {:optional true} [:maybe :string]]
+   [:database_id {:optional true} [:maybe :int]]
+   [:collection  {:optional true} [:maybe ::card-collection]]
+   [:verified    {:optional true} [:maybe :boolean]]
+   [:updated_at  {:optional true} [:maybe :any]]
+   [:created_at  {:optional true} [:maybe :any]]])
+
+(mr/def ::card-search-response
+  "Search results containing saved questions and models."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:data [:sequential ::card-summary]]
+   [:total_count :int]])
+
+(mr/def ::card-parameter
+  "A parameter that can be bound when executing a card."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:id       :string]
+   [:name     {:optional true} [:maybe :string]]
+   [:slug     {:optional true} [:maybe :string]]
+   [:type     :string]
+   [:default  {:optional true} :any]
+   [:required {:optional true} [:maybe :boolean]]
+   [:values_query_type  {:optional true} [:maybe :string]]
+   [:values_source_type {:optional true} [:maybe :string]]])
+
+(mr/def ::native-template-tag
+  "A template tag inside a native card's SQL (the `{{tag}}` substitutions)."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:name         :string]
+   [:display_name {:optional true} [:maybe :string]]
+   [:type         {:optional true} [:maybe :string]]
+   [:required     {:optional true} [:maybe :boolean]]
+   [:default      {:optional true} :any]])
+
+(mr/def ::card-detail
+  "Full details for a saved question or model."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:id          :int]
+   [:type        [:enum "question" "model"]]
+   [:name        :string]
+   [:description {:optional true} [:maybe :string]]
+   [:database_id {:optional true} [:maybe :int]]
+   [:collection_id {:optional true} [:maybe :int]]
+   [:query_type  [:enum "native" "query"]]
+   [:parameters  [:sequential ::card-parameter]]
+   [:native_query         {:optional true} [:maybe :string]]
+   [:native_template_tags {:optional true} [:maybe [:sequential ::native-template-tag]]]])
+
+(mr/def ::database-summary
+  "A database visible to the current user."
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:id     :int]
+   [:name   :string]
+   [:engine {:optional true} [:maybe :string]]
+   [:native_permissions [:enum "write" "none"]]])
+
+(mr/def ::list-databases-response
+  [:map {:encode/api #(update-keys % metabot.u/safe->snake_case_en)}
+   [:data [:sequential ::database-summary]]
+   [:total_count :int]])
+
+(mr/def ::native-query-request
+  "Request schema for /v1/native."
+  [:map
+   [:database_id {:tool/description "ID of the database to query. Obtain from list_databases."}
+    ms/PositiveInt]
+   [:sql {:tool/description "The native SQL query to run. Template tags like {{tag}} may be used with matching entries in template_tags."}
+    ms/NonBlankString]
+   [:template_tags {:optional true
+                    :tool/description "Optional map of template-tag name -> definition, mirroring Metabase's card template_tags shape."}
+    [:maybe [:map-of :string :any]]]
+   [:parameters {:optional true
+                 :tool/description "Optional list of parameter bindings to apply to the query. Each element is a Metabase parameter map."}
+    [:maybe [:sequential [:map-of :keyword :any]]]]
+   [:limit {:optional true
+            :tool/description "Row cap (hard maximum 500). Defaults to 500."}
+    [:maybe :int]]])
+
+(mr/def ::execute-card-request
+  "Request schema for /v1/card/:id/execute."
+  [:map
+   [:parameters {:optional true
+                 :tool/description "Optional list of parameter bindings. Each is a Metabase parameter map; use get_card to see the parameter IDs and types."}
+    [:maybe [:sequential [:map-of :keyword :any]]]]])
+
+;;; Helpers ---------------------------------------------------------------------------------------
+
+(def ^:private card-entity-types
+  ["question" "model"])
+
+(defn- postprocess-card-search-result
+  "Shape a metabot-search result into the agent API card summary format. metabot-search already
+   returns :type as \"question\" or \"model\"; we just trim the fields we want to expose."
+  [result]
+  (select-keys result
+               [:id :type :name :description :database_id :collection :verified :updated_at :created_at]))
+
+(defn- sanitize-card-parameter
+  "Return the agent-API view of a card parameter — the bits an LLM needs to bind it."
+  [{:keys [id name slug type default required values_query_type values_source_type]}]
+  (cond-> {:id (str id)
+           :type (some-> type u/qualified-name)}
+    name               (assoc :name name)
+    slug               (assoc :slug slug)
+    (some? default)    (assoc :default default)
+    (some? required)   (assoc :required required)
+    values_query_type  (assoc :values_query_type (u/qualified-name values_query_type))
+    values_source_type (assoc :values_source_type (u/qualified-name values_source_type))))
+
+(defn- read-key
+  "Look up `k` (keyword) in a map that may have keyword *or* string keys. dataset_query round-trips
+   through `lib-be/normalize-query` which preserves whichever form it received, so we accept both."
+  [m k]
+  (or (get m k) (get m (name k))))
+
+(defn- template-tags->response
+  "Convert a card's :template-tags map to a list of ::native-template-tag entries.
+   Tag values may have keyword *or* string keys depending on whether they came through
+   `lib-be/normalize-query` after a JSON round-trip — fall back via `read-key`."
+  [template-tags]
+  (->> template-tags
+       (map (fn [[_ tag]]
+              (let [display-name (or (read-key tag :display-name)
+                                     (read-key tag :display_name))
+                    tag-type     (read-key tag :type)
+                    required     (read-key tag :required)
+                    default      (read-key tag :default)]
+                (cond-> {:name (or (read-key tag :name) "")}
+                  display-name      (assoc :display_name display-name)
+                  tag-type          (assoc :type (u/qualified-name tag-type))
+                  (some? required)  (assoc :required (boolean required))
+                  (some? default)   (assoc :default default)))))
+       vec))
+
+(defn- native-query-readable?
+  "A user can see a native card's SQL when they have adhoc native perms on the card's database.
+   Mirrors the check used by the card-detail query endpoint before a native query is exposed."
+  [database-id]
+  (qp.perms/current-user-has-adhoc-native-query-perms? {:database database-id}))
+
+(defn- native-source
+  "Return `{:database :sql :template-tags}` for any-shape `dataset-query` that is a native query
+   (legacy `{:type :native :native {:query :template-tags}}` *or* MBQL 5 `{:lib/type :mbql/query
+   :stages [{:lib/type :mbql.stage/native :native :template-tags}]}`). Returns nil for non-native."
+  [dataset-query]
+  (when (map? dataset-query)
+    (let [query-type-kw (lib/normalized-query-type dataset-query)
+          first-stage   (first (or (read-key dataset-query :stages) []))
+          mbql5-native? (= :mbql.stage/native (read-key first-stage :lib/type))
+          legacy-native (when (= :native query-type-kw)
+                          (let [block (read-key dataset-query :native)]
+                            {:database      (read-key dataset-query :database)
+                             :sql           (read-key block :query)
+                             :template-tags (read-key block :template-tags)}))]
+      (cond
+        legacy-native legacy-native
+        mbql5-native? {:database      (read-key dataset-query :database)
+                       :sql           (read-key first-stage :native)
+                       :template-tags (read-key first-stage :template-tags)}))))
+
+(defn- card->detail
+  "Build the agent-API card detail payload, redacting native SQL when the caller lacks native perms."
+  [card]
+  (let [dataset-query (:dataset_query card)
+        native        (native-source dataset-query)
+        query-type    (if native "native" "query")
+        show-sql?     (and native (native-query-readable? (:database native)))
+        base          {:id            (:id card)
+                       :type          (if (= (:type card) :model) "model" "question")
+                       :name          (:name card)
+                       :description   (:description card)
+                       :database_id   (:database_id card)
+                       :collection_id (:collection_id card)
+                       :query_type    query-type
+                       :parameters    (mapv sanitize-card-parameter (:parameters card []))}]
+    (cond-> base
+      show-sql? (assoc :native_query         (:sql native)
+                       :native_template_tags (template-tags->response (:template-tags native))))))
+
+(defn- cap-limit
+  "Clamp a user-supplied limit to `[1, max-total-row-limit]`, defaulting to `default-query-row-limit`."
+  [limit]
+  (if (and (int? limit) (pos? limit))
+    (min limit max-total-row-limit)
+    default-query-row-limit))
+
+(defn- execution-constraints
+  "Hard row-cap applied to card and native executions so tool responses stay within LLM context."
+  [limit]
+  (let [capped (cap-limit limit)]
+    {:max-results           capped
+     :max-results-bare-rows capped}))
+
+(defn- list-visible-databases
+  "Return non-audit databases the current user can create queries against, with :native_permissions set."
+  []
+  (let [user-info    {:user-id          api/*current-user-id*
+                      :is-superuser?    (mi/superuser?)
+                      :is-data-analyst? api/*is-data-analyst?*}
+        where-clause [:and
+                      [:= :is_audit false]
+                      [:= :router_database_id nil]
+                      [:or
+                       (:clause (mi/visible-filter-clause :model/Database :id user-info
+                                                          {:perms/create-queries :query-builder}))
+                       (:clause (mi/visible-filter-clause :model/Database :id user-info
+                                                          {:perms/manage-database :yes}))]]
+        dbs          (t2/select :model/Database {:order-by [:%lower.name :%lower.engine]
+                                                 :where    where-clause})
+        dbs          (filter mi/can-query? dbs)]
+    (perms/prime-db-cache (map :id dbs))
+    (mapv (fn [db]
+            {:id     (:id db)
+             :name   (:name db)
+             :engine (some-> (:engine db) u/qualified-name)
+             :native_permissions
+             (if (= :query-builder-and-native
+                    (perms/full-db-permission-for-user
+                     api/*current-user-id*
+                     :perms/create-queries
+                     (u/the-id db)))
+               "write"
+               "none")})
+          dbs)))
+
+;;; Endpoints -------------------------------------------------------------------------------------
+
+(api.macros/defendpoint :post "/v1/search/cards" :- ::card-search-response
+  "Search for saved questions and models."
+  {:scope "agent:search"
+   :tool  {:name "search_cards"
+           :description (str "Search for saved questions and models in Metabase. "
+                             "Use term_queries for keyword search or semantic_queries for natural-language search. "
+                             "Both arguments are arrays of strings. Returns cards the current user can read.")
+           :annotations {:read-only? true}}}
+  [_route-params
+   _query-params
+   {term-queries     :term_queries
+    semantic-queries :semantic_queries}
+   :- [:map
+       [:term_queries     {:optional true
+                           :tool/description "Keyword search queries, e.g. [\"quarterly revenue\"]."}
+        [:maybe [:or [:sequential ms/NonBlankString] ms/NonBlankString]]]
+       [:semantic_queries {:optional true
+                           :tool/description "Natural-language search queries, e.g. [\"which questions show revenue by quarter\"]."}
+        [:maybe [:or [:sequential ms/NonBlankString] ms/NonBlankString]]]]]
+  (let [raw-results (metabot-search/search
+                     {:term-queries     (or (coerce-query-list term-queries) [])
+                      :semantic-queries (or (coerce-query-list semantic-queries) [])
+                      :entity-types     card-entity-types
+                      :limit            (or (request/limit) 50)})
+        results     (mapv postprocess-card-search-result raw-results)]
+    {:data        results
+     :total_count (count results)}))
+
+(api.macros/defendpoint :get "/v1/database" :- ::list-databases-response
+  "List databases the current user can query."
+  {:scope "agent:metric:read"
+   :tool  {:name "list_databases"
+           :description (str "List databases the current user can query. Each database includes its id, name, "
+                             "engine, and native_permissions (\"write\" means the user can run ad-hoc native SQL "
+                             "against this database via execute_native_query).")
+           :annotations {:read-only? true}}}
+  []
+  (let [dbs (list-visible-databases)]
+    {:data        dbs
+     :total_count (count dbs)}))
+
+(api.macros/defendpoint :get "/v1/card/:id" :- ::card-detail
+  "Get details for a saved question or model, including its parameters and (if accessible) native SQL."
+  {:scope "agent:metric:read"
+   :tool  {:name "get_card"
+           :description (str "Get details about a saved question or model by id. "
+                             "Includes parameters (id, name, type, default, required) so you know what to pass to "
+                             "execute_card. If the card is a native SQL question and the current user has native "
+                             "query permissions on its database, the response also includes native_query and "
+                             "native_template_tags.")
+           :annotations {:read-only? true}}}
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]]
+  (card->detail (api/read-check :model/Card id)))
+
+(api.macros/defendpoint :get "/v1/card/:id/params/:param-key/values" :- :any
+  "Fetch the allowed values for a card parameter."
+  {:scope "agent:metric:read"
+   :tool  {:name "get_card_parameter_values"
+           :description (str "Fetch the allowed values for a card parameter. Use this after get_card to discover "
+                             "which values can be bound to a parameter before calling execute_card.")
+           :annotations {:read-only? true}}}
+  [{:keys [id param-key]} :- [:map
+                              [:id        ms/PositiveInt]
+                              [:param-key {:tool/description "Parameter id, from get_card.parameters[].id."}
+                               ms/NonBlankString]]]
+  (binding [qp.perms/*param-values-query* true]
+    (queries/card-param-values (api/read-check :model/Card id) param-key)))
+
+(api.macros/defendpoint :post "/v1/card/:id/execute"
+  :- (streaming-response/streaming-response-schema ::execute-query-response)
+  "Execute a saved question or model with optional parameter bindings.
+
+   Row output is capped at 500 rows regardless of the card's own limit, because results stream back
+   into the LLM context."
+  {:scope "agent:query:execute"
+   :tool  {:name "execute_card"
+           :description (str "Execute a saved question or model by id with optional parameter bindings. "
+                             "Use get_card first to discover the parameters. Results are capped at 500 rows.")}}
+  [{:keys [id]} :- [:map [:id ms/PositiveInt]]
+   _query-params
+   {:keys [parameters]} :- ::execute-card-request]
+  (qp.card/process-query-for-card
+   id :api
+   :parameters  parameters
+   :context     :question
+   :constraints (execution-constraints nil)
+   :middleware  {:process-viz-settings? false
+                 :js-int-to-string?     true}))
+
+(api.macros/defendpoint :post "/v1/native"
+  :- (streaming-response/streaming-response-schema ::execute-query-response)
+  "Execute an ad-hoc native SQL query against a database.
+
+   Gated by the current user's native query permissions on the target database (the same gate used
+   by Metabase's built-in native SQL editor). Results are capped at 500 rows."
+  {:scope "agent:query:execute"
+   :tool  {:name "execute_native_query"
+           :description (str "Execute an ad-hoc native SQL query against a Metabase database. "
+                             "The current user must have native-query permissions on the database "
+                             "(see list_databases.native_permissions). "
+                             "Results are capped at 500 rows. "
+                             "Prefer execute_card for trusted, reusable queries.")}}
+  [_route-params
+   _query-params
+   {:keys [database_id sql template_tags parameters limit]} :- ::native-query-request]
+  (api/read-check :model/Database database_id)
+  (let [query {:database   database_id
+               :type       :native
+               :native     (cond-> {:query sql}
+                             template_tags (assoc :template-tags template_tags))
+               :parameters (or parameters [])}]
+    (qp.perms/check-current-user-has-adhoc-native-query-perms query)
+    (let [prepared (-> query
+                       (update-in [:middleware :js-int-to-string?] (fnil identity true))
+                       qp/userland-query
+                       (assoc :constraints (execution-constraints limit))
+                       (update :info merge {:executed-by api/*current-user-id*
+                                            :context     :agent}))]
+      (qp.streaming/streaming-response [rff :api]
+        (qp/process-query prepared rff)))))
 
 ;;; ------------------------------------------------- Authentication -------------------------------------------------
 ;;
