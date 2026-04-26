@@ -88,10 +88,6 @@ bat = "latest"
 # https://github.com/junegunn/fzf
 fzf = "latest"
 
-# fd - A fast alternative to find
-# https://github.com/sharkdp/fd
-fd = "latest"
-
 # ripgrep - A fast alternative to grep
 # https://github.com/BurntSushi/ripgrep
 ripgrep = "latest"
@@ -108,6 +104,6 @@ awscli = "latest"
 # https://developer.1password.com/docs/cli/get-started/
 op = "latest"
 
-# jq - Command-line JSON processor
-# https://github.com/jqlang/jq
-jq = "latest"
+[tasks.test-mcp-contract]
+description = "Run the MCP black-box contract smoke test"
+run = "bun run test-mcp-contract"
