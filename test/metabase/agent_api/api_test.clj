@@ -2,6 +2,8 @@
   "Agent API functional tests using session-based authentication.
    JWT and scope-related tests live in metabase-enterprise.agent-api.api-test."
   (:require
+   [clojure.data.csv :as data.csv]
+   [clojure.string :as str]
    [clojure.test :refer :all]
    [environ.core :as env]
    [java-time.api :as t]
@@ -266,12 +268,12 @@
         (is (= (mt/id) (lib/database-id decoded)))
         (is (= (mt/id :orders) (lib/primary-source-table-id decoded))))))
 
-  (testing "Applies default limit of 500 when no limit is specified"
+  (testing "Applies default limit of 200 when no limit is specified"
     (let [table-id (mt/id :orders)
           response (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
                                          {:table_id table-id})
           decoded  (decode-query response)]
-      (is (= 500 (lib/current-limit decoded)))))
+      (is (= 200 (lib/current-limit decoded)))))
 
   (testing "Respects explicit limit"
     (let [table-id (mt/id :orders)
@@ -287,32 +289,78 @@
                                  {:table_id 999999})))))
 
 (deftest execute-query-test
-  (testing "Executes a query and returns results with column metadata"
+  (testing "Default (csv) format returns slim shape with data.csv and trimmed cols"
     (let [table-id       (mt/id :orders)
           construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
                                                {:table_id table-id
                                                 :limit    5})
-          ;; Streaming response returns 202 (accepted) since it starts streaming before completion
-          execute-resp   (mt/user-http-request :rasta :post 202 "agent/v1/execute"
+          execute-resp   (mt/user-http-request :rasta :post 200 "agent/v1/execute"
                                                {:query (:query construct-resp)})]
       (is (=? {:status    "completed"
                :row_count 5
+               :truncated false
                :data      {:cols (fn [cols]
                                    (and (seq cols)
                                         (every? :name cols)
-                                        (every? :base_type cols)))
-                           :rows (fn [rows] (= 5 (count rows)))}}
-              execute-resp))))
+                                        (every? :base_type cols)
+                                        (every? :display_name cols)
+                                        (every? #(= #{:name :display_name :base_type} (set (keys %))) cols)))
+                           :csv  string?}}
+              execute-resp))
+      (is (not (contains? (:data execute-resp) :rows)) "csv format should omit data.rows")
+      (testing "Top-level keys are limited to the slim set"
+        (is (= #{:status :row_count :truncated :running_time :started_at :data}
+               (set (keys execute-resp)))))
+      (testing "CSV header row is the column :name list"
+        (let [first-line (first (str/split-lines (:csv (:data execute-resp))))
+              col-names  (mapv :name (:cols (:data execute-resp)))]
+          (is (= (str/join "," col-names) first-line))))))
 
-  (testing "Enforces agent query row limit even when query specifies a higher limit"
+  (testing "format=json returns data.rows and omits data.csv"
+    (let [table-id       (mt/id :orders)
+          construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
+                                               {:table_id table-id
+                                                :limit    3})
+          execute-resp   (mt/user-http-request :rasta :post 200 "agent/v1/execute"
+                                               {:query (:query construct-resp) :format "json"})]
+      (is (=? {:status    "completed"
+               :row_count 3
+               :truncated false
+               :data      {:cols sequential?
+                           :rows (fn [rows] (= 3 (count rows)))}}
+              execute-resp))
+      (is (not (contains? (:data execute-resp) :csv)) "json format should omit data.csv")))
+
+  (testing "Soft cap clamps the constructed query's higher limit and sets truncated=true"
+    ;; Default soft cap for csv is 500; constructing a query with limit=600 should still return 500 rows.
     (let [table-id       (mt/id :orders)
           construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
                                                {:table_id table-id
                                                 :limit    600})
-          execute-resp   (mt/user-http-request :rasta :post 202 "agent/v1/execute"
+          execute-resp   (mt/user-http-request :rasta :post 200 "agent/v1/execute"
                                                {:query (:query construct-resp)})]
-      (is (=? {:status "completed" :row_count 500}
-              execute-resp)))))
+      (is (=? {:status "completed" :row_count 500 :truncated true} execute-resp))))
+
+  (testing "JSON soft cap is 200 (vs 500 for csv) and truncates accordingly"
+    (let [table-id       (mt/id :orders)
+          construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
+                                               {:table_id table-id
+                                                :limit    600})
+          execute-resp   (mt/user-http-request :rasta :post 200 "agent/v1/execute"
+                                               {:query (:query construct-resp) :format "json"})]
+      (is (=? {:status "completed" :row_count 200 :truncated true} execute-resp))))
+
+  (testing "User-supplied limit above the format hard cap is clamped"
+    (let [table-id       (mt/id :orders)
+          construct-resp (mt/user-http-request :rasta :post 200 "agent/v1/construct-query"
+                                               {:table_id table-id
+                                                :limit    5000})
+          execute-resp   (mt/user-http-request :rasta :post 200 "agent/v1/execute"
+                                               {:query  (:query construct-resp)
+                                                :format "json"
+                                                :limit  10000})]
+      ;; json hard cap is 500
+      (is (=? {:status "completed" :row_count 500 :truncated true} execute-resp)))))
 
 (deftest get-metric-field-values-test
   (ensure-fresh-field-values! (mt/id :orders :quantity))
@@ -432,8 +480,8 @@
   (testing "Continuation token returns next page of results when the total limit exceeds the page size"
     (let [table-id   (mt/id :orders)
           field-id   (visible-field-id table-id "ID")
-          page-size  500
-          total-rows 600
+          page-size  200
+          total-rows 250
           page1      (mt/user-http-request :rasta :post 202 "agent/v1/query"
                                            {:table_id table-id
                                             :order_by [{:field {:field_id field-id} :direction "asc"}]
@@ -593,21 +641,86 @@
                   :type          :question
                   :database_id   (mt/id)
                   :dataset_query (orders-count-query)}]
-    (testing "Executes a saved question and returns results"
-      (is (=? {:status    "completed"
-               :row_count pos?
-               :data      {:cols (fn [cols] (seq cols))
-                           :rows (fn [rows] (seq rows))}}
-              (mt/user-http-request :rasta :post 202 (str "agent/v1/card/" card-id "/execute") {}))))))
+    (testing "Default (csv) format returns slim shape with data.csv"
+      (let [resp (mt/user-http-request :rasta :post 200 (str "agent/v1/card/" card-id "/execute") {})]
+        (is (=? {:status    "completed"
+                 :row_count pos?
+                 :truncated false
+                 :data      {:cols (fn [cols] (and (seq cols)
+                                                   (every? #(= #{:name :display_name :base_type} (set (keys %))) cols)))
+                             :csv  string?}}
+                resp))
+        (is (not (contains? (:data resp) :rows)) "csv format should omit data.rows")))
+
+    (testing "format=json returns data.rows"
+      (let [resp (mt/user-http-request :rasta :post 200 (str "agent/v1/card/" card-id "/execute")
+                                       {:format "json"})]
+        (is (=? {:status "completed" :row_count pos? :data {:rows (fn [rows] (seq rows))}} resp))
+        (is (not (contains? (:data resp) :csv)))))))
+
+(deftest execute-card-with-parameters-test
+  (testing "Native card with a template-tag parameter binds {id, type, value}"
+    (mt/with-temp [:model/Card {card-id :id}
+                   {:name          "AgentExecuteCardParamTest"
+                    :type          :question
+                    :database_id   (mt/id)
+                    :dataset_query {:type     :native
+                                    :database (mt/id)
+                                    :native   {:query         "SELECT {{n}} AS n"
+                                               :template-tags {"n" {:id           "tag-n"
+                                                                    :name         "n"
+                                                                    :display-name "N"
+                                                                    :type         :number
+                                                                    :required     true}}}}
+                    :parameters    [{:id     "tag-n"
+                                     :name   "n"
+                                     :slug   "n"
+                                     :type   "number/="
+                                     :target [:variable [:template-tag "n"]]}]}]
+      (let [resp (mt/user-http-request :crowberto :post 200 (str "agent/v1/card/" card-id "/execute")
+                                       {:parameters [{:id "tag-n" :type "number/=" :value 42}]
+                                        :format     "json"})]
+        (is (=? {:status "completed" :row_count 1 :data {:rows [[42]]}} resp))))))
 
 (deftest execute-native-query-test
-  (testing "Executes a native query for a user with native query perms"
+  (testing "Default (csv) format returns slim shape"
+    (let [resp (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                     {:database_id (mt/id)
+                                      :sql         "SELECT 1 AS x"})]
+      (is (=? {:status    "completed"
+               :row_count 1
+               :truncated false
+               :data      {:cols (fn [cols] (every? #(= #{:name :display_name :base_type} (set (keys %))) cols))
+                           :csv  string?}}
+              resp))
+      (is (not (contains? (:data resp) :rows)))))
+
+  (testing "format=json returns rows as nested arrays"
     (is (=? {:status    "completed"
              :row_count 1
+             :truncated false
              :data      {:rows [[1]]}}
-            (mt/user-http-request :crowberto :post 202 "agent/v1/native"
+            (mt/user-http-request :crowberto :post 200 "agent/v1/native"
                                   {:database_id (mt/id)
-                                   :sql         "SELECT 1"}))))
+                                   :sql         "SELECT 1"
+                                   :format      "json"}))))
+
+  (testing "CSV quoting and null handling round-trip via clojure.data.csv/read-csv"
+    (let [resp     (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                         {:database_id (mt/id)
+                                          :sql         "SELECT 'a,b' AS c1, 'has \"quote\"' AS c2, CAST(NULL AS VARCHAR) AS c3"})
+          csv-str  (-> resp :data :csv)
+          decoded  (vec (data.csv/read-csv (java.io.StringReader. csv-str)))]
+      (is (= [["C1" "C2" "C3"] ["a,b" "has \"quote\"" ""]] decoded))))
+
+  (testing "Date/timestamp columns serialize to ISO 8601 in CSV"
+    (let [resp    (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                        {:database_id (mt/id)
+                                         :sql         "SELECT CAST('2026-04-26' AS DATE) AS d"})
+          decoded (vec (data.csv/read-csv (java.io.StringReader. (-> resp :data :csv))))
+          [_ [date-cell]] decoded]
+      (is (re-matches #"2026-04-26(?:T00:00:00Z)?" date-cell)
+          "date cell should be ISO 8601 (driver may include the zero time component)")))
 
   (testing "Rejects native query when the user lacks adhoc native perms"
     (mt/with-no-data-perms-for-all-users!

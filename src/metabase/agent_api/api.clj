@@ -2,6 +2,7 @@
   "Customer-facing Agent API for headless BI applications.
   Endpoints are versioned (e.g., /v1/search) and use standard HTTP semantics."
   (:require
+   [clojure.data.csv :as data.csv]
    [clojure.string :as str]
    [malli.core :as mc]
    [metabase.agent-api.validation :as agent-api.validation]
@@ -24,7 +25,9 @@
    [metabase.query-processor.card :as qp.card]
    [metabase.query-processor.core :as qp]
    [metabase.query-processor.middleware.permissions :as qp.perms]
+   [metabase.query-processor.reducible :as qp.reducible]
    [metabase.query-processor.streaming :as qp.streaming]
+   [metabase.query-processor.streaming.common :as qp.streaming.common]
    [metabase.request.core :as request]
    [metabase.server.streaming-response :as streaming-response]
    [metabase.util :as u]
@@ -32,7 +35,9 @@
    [metabase.util.log :as log]
    [metabase.util.malli.registry :as mr]
    [metabase.util.malli.schema :as ms]
-   [toucan2.core :as t2]))
+   [toucan2.core :as t2])
+  (:import
+   (java.io StringWriter)))
 
 ;;; --------------------------------------------------- Defaults ------------------------------------------------------
 
@@ -41,20 +46,27 @@
   30)
 
 (def ^:private ^:const default-query-row-limit
-  "Default row cap when :limit is omitted from a table query request.
+  "Default row cap when :limit is omitted from a /v1/query request.
    All rows are streamed back into the LLM context, so keep this tight enough that a
    single tool response stays well under model context limits."
-  500)
+  200)
 
 (def ^:private ^:const page-size
   "Rows returned per page when paginating the combined query endpoint via continuation tokens.
    Also used as the query processor's per-call row constraint."
-  500)
+  200)
 
 (def ^:private ^:const max-total-row-limit
   "Ceiling on the user-requested :limit for the combined query endpoint. Agents can paginate
    through up to this many rows across pages."
   2000)
+
+;; Row caps for the materialized execute_* tools (execute_query, execute_card, execute_native_query).
+;; Format-aware: CSV is ~4-6× more compact per row in the JSON-RPC response so it gets a higher cap.
+(def ^:private ^:const json-soft-limit 200)
+(def ^:private ^:const json-hard-limit 500)
+(def ^:private ^:const csv-soft-limit  500)
+(def ^:private ^:const csv-hard-limit  2000)
 
 ;;; ---------------------------------------------------- Helpers ------------------------------------------------------
 
@@ -767,63 +779,185 @@
                  (when (more-pages-available? page total-limit (:row_count result) items)
                    (generate-continuation-token query total-limit page)))))))))
 
+;;; ----------------------------------------- Execute Tool Helpers (shared) -----------------------------------------
+
+(defn- coerce-format
+  "Normalize a request format param to a keyword, defaulting to :csv."
+  [format]
+  (case format
+    "json" :json
+    :json :json
+    :csv)) ; "csv", :csv, nil all map to :csv
+
+(defn- effective-cap
+  "Effective row cap for an execute_* request. CSV gets a higher cap than JSON because CSV is
+   substantially more compact in JSON-RPC. A user-supplied limit is clamped to the format's hard
+   maximum; an omitted limit defaults to the format's soft maximum."
+  [format limit]
+  (let [[soft hard] (case format
+                      :csv [csv-soft-limit  csv-hard-limit]
+                      :json [json-soft-limit json-hard-limit])]
+    (if (and (int? limit) (pos? limit))
+      (min limit hard)
+      soft)))
+
+(defn- execution-constraints
+  "Constraints to pass to the QP for execute_* tools. We ask for `cap + 1` rows so the response
+   layer can detect whether more data existed and set `truncated=true`."
+  [cap]
+  {:max-results           (inc cap)
+   :max-results-bare-rows (inc cap)})
+
+(defn- trim-col
+  "Reduce a result column to the slim shape we expose: name, display_name, base_type."
+  [col]
+  {:name         (or (:name col)         (some-> (:lib/desired-column-alias col) name))
+   :display_name (or (:display_name col) (:display-name col))
+   :base_type    (some-> (or (:base_type col) (:base-type col)) u/qualified-name)})
+
+(defn- format-csv-cell
+  "Format a single value for CSV output: nils become empty strings, dates/times/etc. go through
+   `qp.streaming.common/format-value` so they emit ISO 8601, everything else is stringified."
+  [v]
+  (let [formatted (qp.streaming.common/format-value v)]
+    (if (nil? formatted) "" (str formatted))))
+
+(defn- rows->csv
+  "Encode `cols` + `rows` as a single RFC 4180 CSV string. Header row uses each column's `:name`
+   so consumers can build a pandas dtype map keyed by the same identifier the CSV header uses."
+  [cols rows]
+  (let [sw     (StringWriter.)
+        header (mapv :name cols)
+        body   (mapv #(mapv format-csv-cell %) rows)]
+    (data.csv/write-csv sw (cons header body))
+    (.toString sw)))
+
+(defn- slim-response
+  "Trim a QP result map to the lean execute_* response shape, encoding rows as CSV when requested.
+
+   - `format`: `:csv` (default) or `:json`
+   - `cap`:    effective row cap; we received up to `cap + 1` rows from the QP so we can detect
+               whether more data existed.
+
+   Drops Metabase internals not useful to LLM consumers (cached, database_id, json_query,
+   average_execution_time, context, native_form, results_metadata, results_timezone, format-rows?,
+   pivot-export-options, insights, plus per-column lib/*, field_ref, source, database_type,
+   effective_type, semantic_type, fingerprint)."
+  [result format cap]
+  (let [{:keys [status running_time started_at error]
+         result-data :data
+         result-row-count :row_count} result
+        all-rows  (vec (or (:rows result-data) []))
+        truncated? (> (count all-rows) cap)
+        rows      (if truncated? (subvec all-rows 0 cap) all-rows)
+        cols      (mapv trim-col (or (:cols result-data) []))
+        data      (cond-> {:cols cols}
+                    (= format :csv)  (assoc :csv (rows->csv cols rows))
+                    (= format :json) (assoc :rows rows))]
+    (cond-> {:status    (or status :completed)
+             :row_count (if truncated? cap (or result-row-count (count rows)))
+             :truncated truncated?
+             :data      data}
+      running_time (assoc :running_time running_time)
+      started_at   (assoc :started_at started_at)
+      error        (assoc :error error))))
+
 ;;; ------------------------------------------------- Execute Query --------------------------------------------------
 
 (mr/def ::execute-query-request
   "Request schema for /v1/execute. Accepts a base64-encoded MBQL query."
   [:map
    [:query {:tool/description "A base64-encoded query string returned by /v1/construct-query. Do not construct this value manually."}
-    ms/NonBlankString]])
+    ms/NonBlankString]
+   [:format {:optional true
+             :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
+    [:maybe [:enum "csv" "json"]]]
+   [:limit  {:optional true
+             :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped."}
+    [:maybe ms/PositiveInt]]])
 
 (mr/def ::column-metadata
-  "Metadata for a single result column."
+  "Metadata for a single result column. Use base_type for pandas dtype mapping when reading data.csv."
   [:map
-   [:name           :string]
-   [:base_type      :string]
-   [:effective_type {:optional true} [:maybe :string]]
-   [:display_name   :string]])
+   [:name         :string]
+   [:display_name :string]
+   [:base_type    :string]])
 
 (mr/def ::execute-query-response
-  "Response from query execution. The HTTP status is always 202 because results are streamed —
-   check the `status` field to determine success or failure."
+  "Slim response from execute_* tools. The HTTP status is always 202 because results stream —
+   check the `status` field to determine success or failure.
+
+   When format=\"csv\" (default), rows live in data.csv as a single RFC 4180 CSV string with a
+   header row of column names; data.rows is omitted. When format=\"json\", data.rows is the array
+   of arrays and data.csv is omitted. data.cols is always present so consumers can build a pandas
+   dtype map keyed by name.
+
+   `truncated` is true when more rows existed than were returned (either the cap kicked in or the
+   user-supplied limit was clamped down to the format's hard maximum)."
+  [:map
+   [:status       [:enum :completed :failed]]
+   [:row_count    {:optional true} :int]
+   [:truncated    {:optional true} :boolean]
+   [:running_time {:optional true} :int]
+   [:started_at   {:optional true} :any]
+   [:data         {:optional true}
+    [:map
+     [:cols [:sequential ::column-metadata]]
+     [:rows {:optional true} [:sequential [:sequential :any]]]
+     [:csv  {:optional true} :string]]]
+   [:error        {:optional true} :string]])
+
+(mr/def ::query-response
+  "Response schema for the paginated /v1/query endpoint. Uses the full Metabase :api streaming
+   shape (data.cols/data.rows with full column metadata) plus an optional continuation_token."
   [:map
    [:status       [:enum :completed :failed]]
    [:data         {:optional true}
     [:map
-     [:cols [:sequential ::column-metadata]]
+     [:cols [:sequential [:map
+                          [:name         :string]
+                          [:display_name :string]
+                          [:base_type    :string]
+                          [:effective_type {:optional true} [:maybe :string]]]]]
      [:rows [:sequential [:sequential :any]]]]]
-   [:row_count    {:optional true} :int]
-   [:running_time {:optional true} :int]
-   [:error        {:optional true} :string]])
+   [:row_count          {:optional true} :int]
+   [:running_time       {:optional true} :int]
+   [:error              {:optional true} :string]
+   [:continuation_token {:optional true} [:maybe :string]]])
 
-(mr/def ::query-response
-  "Extends ::execute-query-response with an optional continuation_token for pagination."
-  [:merge ::execute-query-response
-   [:map [:continuation_token {:optional true} [:maybe :string]]]])
-
-(api.macros/defendpoint :post "/v1/execute"
-  :- (streaming-response/streaming-response-schema ::execute-query-response)
+(api.macros/defendpoint :post "/v1/execute" :- ::execute-query-response
   "Execute an MBQL query and return results.
 
   Accepts a base64-encoded MBQL query (as returned by /v1/construct-query) and executes it,
-  returning results with column metadata.
+  returning results with slim column metadata. Default response format is CSV (data.csv); pass
+  format=\"json\" to get arrays of arrays under data.rows instead.
 
-  Response format:
-  - On success: {:data {:cols [...] :rows [...]} :row_count N :status :completed :running_time M}
-  - On failure: {:status :failed :error \"message\" ...}
-
-  Agent query row limits are enforced (500 rows per request)."
+  Row caps are format-aware: 200 default / 500 max for json, 500 default / 2000 max for csv.
+  When more rows existed than were returned, `truncated` is true."
   {:scope "agent:query:execute"
    :tool  {:name "execute_query"
-           :description "Execute a previously constructed query and return the results with column metadata, row count, and execution time."}}
+           :description (str "Execute a previously constructed query and return slim results with column metadata, "
+                             "row count, and execution time.\n\n"
+                             "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
+                             "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
+                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
+                             "dtype map keyed by name.\n\n"
+                             "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
+                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "When more rows existed than were returned, the response sets truncated=true.\n\n"
+                             "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
+                             "when format=\"csv\".")}}
   [_route-params
    _query-params
-   {encoded-query :query} :- ::execute-query-request]
-  (let [query (-> encoded-query
-                  u/decode-base64
-                  json/decode+kw)]
-    (qp.streaming/streaming-response [rff :api]
-      (qp/process-query (prepare-combined-query query) rff))))
+   {encoded-query :query format :format limit :limit} :- ::execute-query-request]
+  (let [fmt      (coerce-format format)
+        cap      (effective-cap fmt limit)
+        query    (-> encoded-query u/decode-base64 json/decode+kw)
+        prepared (-> query
+                     prepare-agent-query
+                     (assoc :constraints (execution-constraints cap)))
+        result   (qp/process-query prepared qp.reducible/default-rff)]
+    (slim-response result fmt cap)))
 
 ;;; ------------------------------------------------ Cards & Databases ------------------------------------------------
 ;;
@@ -922,16 +1056,25 @@
    [:parameters {:optional true
                  :tool/description "Optional list of parameter bindings to apply to the query. Each element is a Metabase parameter map."}
     [:maybe [:sequential [:map-of :keyword :any]]]]
+   [:format {:optional true
+             :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
+    [:maybe [:enum "csv" "json"]]]
    [:limit {:optional true
-            :tool/description "Row cap (hard maximum 500). Defaults to 500."}
-    [:maybe :int]]])
+            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped and truncated=true is set."}
+    [:maybe ms/PositiveInt]]])
 
 (mr/def ::execute-card-request
   "Request schema for /v1/card/:id/execute."
   [:map
    [:parameters {:optional true
                  :tool/description "Optional list of parameter bindings. Each is a Metabase parameter map; use get_card to see the parameter IDs and types."}
-    [:maybe [:sequential [:map-of :keyword :any]]]]])
+    [:maybe [:sequential [:map-of :keyword :any]]]]
+   [:format {:optional true
+             :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
+    [:maybe [:enum "csv" "json"]]]
+   [:limit {:optional true
+            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped and truncated=true is set."}
+    [:maybe ms/PositiveInt]]])
 
 ;;; Helpers ---------------------------------------------------------------------------------------
 
@@ -1026,20 +1169,6 @@
     (cond-> base
       show-sql? (assoc :native_query         (:sql native)
                        :native_template_tags (template-tags->response (:template-tags native))))))
-
-(defn- cap-limit
-  "Clamp a user-supplied limit to `[1, max-total-row-limit]`, defaulting to `default-query-row-limit`."
-  [limit]
-  (if (and (int? limit) (pos? limit))
-    (min limit max-total-row-limit)
-    default-query-row-limit))
-
-(defn- execution-constraints
-  "Hard row-cap applied to card and native executions so tool responses stay within LLM context."
-  [limit]
-  (let [capped (cap-limit limit)]
-    {:max-results           capped
-     :max-results-bare-rows capped}))
 
 (defn- list-visible-databases
   "Return non-audit databases the current user can create queries against, with :native_permissions set."
@@ -1143,45 +1272,72 @@
   (binding [qp.perms/*param-values-query* true]
     (queries/card-param-values (api/read-check :model/Card id) param-key)))
 
-(api.macros/defendpoint :post "/v1/card/:id/execute"
-  :- (streaming-response/streaming-response-schema ::execute-query-response)
+(api.macros/defendpoint :post "/v1/card/:id/execute" :- ::execute-query-response
   "Execute a saved question or model with optional parameter bindings.
 
-   Row output is capped at 500 rows regardless of the card's own limit, because results stream back
-   into the LLM context."
+   Returns slim, materialized results suitable for LLM context. Default response format is CSV
+   (data.csv); pass format=\"json\" to get arrays of arrays under data.rows instead. Row caps are
+   format-aware: json defaults to 200 (max 500), csv defaults to 500 (max 2000)."
   {:scope "agent:query:execute"
    :tool  {:name "execute_card"
            :description (str "Execute a saved question or model by id with optional parameter bindings. "
-                             "Use get_card first to discover the parameters. Results are capped at 500 rows.")}}
+                             "Use get_card first to discover the parameters.\n\n"
+                             "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
+                             "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
+                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
+                             "dtype map keyed by name.\n\n"
+                             "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
+                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "When more rows existed than were returned, the response sets truncated=true.\n\n"
+                             "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
+                             "when format=\"csv\".")}}
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]
    _query-params
-   {:keys [parameters]} :- ::execute-card-request]
-  (qp.card/process-query-for-card
-   id :api
-   :parameters  parameters
-   :context     :question
-   :constraints (execution-constraints nil)
-   :middleware  {:process-viz-settings? false
-                 :js-int-to-string?     true}))
+   {:keys [parameters format limit]} :- ::execute-card-request]
+  (let [fmt     (coerce-format format)
+        cap     (effective-cap fmt limit)
+        run-fn  (fn [qp _export-format]
+                  (fn [query info]
+                    (qp (update query :info merge info) qp.reducible/default-rff)))
+        result  (qp.card/process-query-for-card
+                 id :api
+                 :parameters  parameters
+                 :context     :question
+                 :constraints (execution-constraints cap)
+                 :middleware  {:process-viz-settings? false
+                               :js-int-to-string?     true}
+                 :make-run    run-fn)]
+    (slim-response result fmt cap)))
 
-(api.macros/defendpoint :post "/v1/native"
-  :- (streaming-response/streaming-response-schema ::execute-query-response)
+(api.macros/defendpoint :post "/v1/native" :- ::execute-query-response
   "Execute an ad-hoc native SQL query against a database.
 
    Gated by the current user's native query permissions on the target database (the same gate used
-   by Metabase's built-in native SQL editor). Results are capped at 500 rows."
+   by Metabase's built-in native SQL editor). Default response format is CSV (data.csv); pass
+   format=\"json\" to get arrays of arrays under data.rows instead. Row caps are format-aware: json
+   defaults to 200 (max 500), csv defaults to 500 (max 2000)."
   {:scope "agent:query:execute"
    :tool  {:name "execute_native_query"
            :description (str "Execute an ad-hoc native SQL query against a Metabase database. "
                              "The current user must have native-query permissions on the database "
                              "(see list_databases.native_permissions). "
-                             "Results are capped at 500 rows. "
-                             "Prefer execute_card for trusted, reusable queries.")}}
+                             "Prefer execute_card for trusted, reusable queries.\n\n"
+                             "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
+                             "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
+                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
+                             "dtype map keyed by name.\n\n"
+                             "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
+                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "When more rows existed than were returned, the response sets truncated=true.\n\n"
+                             "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
+                             "when format=\"csv\".")}}
   [_route-params
    _query-params
-   {:keys [database_id sql template_tags parameters limit]} :- ::native-query-request]
+   {:keys [database_id sql template_tags parameters format limit]} :- ::native-query-request]
   (api/read-check :model/Database database_id)
-  (let [query {:database   database_id
+  (let [fmt   (coerce-format format)
+        cap   (effective-cap fmt limit)
+        query {:database   database_id
                :type       :native
                :native     (cond-> {:query sql}
                              template_tags (assoc :template-tags template_tags))
@@ -1190,11 +1346,11 @@
     (let [prepared (-> query
                        (update-in [:middleware :js-int-to-string?] (fnil identity true))
                        qp/userland-query
-                       (assoc :constraints (execution-constraints limit))
+                       (assoc :constraints (execution-constraints cap))
                        (update :info merge {:executed-by api/*current-user-id*
-                                            :context     :agent}))]
-      (qp.streaming/streaming-response [rff :api]
-        (qp/process-query prepared rff)))))
+                                            :context     :agent}))
+          result   (qp/process-query prepared qp.reducible/default-rff)]
+      (slim-response result fmt cap))))
 
 ;;; ------------------------------------------------- Authentication -------------------------------------------------
 ;;
