@@ -728,6 +728,84 @@
                             {:database_id (mt/id)
                              :sql         "SELECT 1"}))))
 
+(deftest cols->pandas-kwargs-test
+  (let [f (var-get #'agent-api.api/cols->pandas-kwargs)]
+    (testing "Numeric, text, boolean go in :dtype; temporal go in :parse_dates"
+      (is (= {:dtype       {"ID"      "Int64"
+                            "TOTAL"   "Float64"
+                            "NAME"    "string"
+                            "ACTIVE"  "boolean"}
+              :parse_dates ["BORN" "CREATED_AT"]}
+             (f [{:name "ID"         :base_type "type/BigInteger"}
+                 {:name "TOTAL"      :base_type "type/Float"}
+                 {:name "NAME"       :base_type "type/Text"}
+                 {:name "ACTIVE"     :base_type "type/Boolean"}
+                 {:name "BORN"       :base_type "type/Date"}
+                 {:name "CREATED_AT" :base_type "type/DateTimeWithLocalTZ"}]))))
+    (testing "isa? walks the hierarchy — semantic-type-ish descendants land in the right bucket"
+      (is (= {:dtype       {"AMT"   "Float64"   ; type/Currency isa? type/Number
+                            "EMAIL" "string"    ; type/Email isa? type/Text
+                            "SCORE" "Float64"}  ; type/Score isa? type/Number
+              :parse_dates ["TS"]}              ; type/CreationTimestamp isa? type/DateTime
+             (f [{:name "AMT"   :base_type "type/Currency"}
+                 {:name "EMAIL" :base_type "type/Email"}
+                 {:name "SCORE" :base_type "type/Score"}
+                 {:name "TS"    :base_type "type/CreationTimestamp"}]))))
+    (testing "Unknown / unmapped types fall through to dtype \"string\""
+      (is (= {:dtype {"X" "string"} :parse_dates []}
+             (f [{:name "X" :base_type "type/Unknown"}]))))
+    (testing "Bare type/Time stays as string (pandas can't parse a time-of-day cleanly)"
+      (is (= {:dtype {"WHEN" "string"} :parse_dates []}
+             (f [{:name "WHEN" :base_type "type/TimeWithLocalTZ"}]))))))
+
+(deftest execute-pandas-hints-test
+  (testing "data.pandas appears in CSV responses, omitted from JSON"
+    (let [csv-resp  (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                          {:database_id (mt/id)
+                                           :sql         "SELECT 1"
+                                           :format      "csv"})
+          json-resp (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                          {:database_id (mt/id)
+                                           :sql         "SELECT 1"
+                                           :format      "json"})]
+      (is (=? {:data {:pandas {:dtype       map?
+                               :parse_dates sequential?}}}
+              csv-resp))
+      (is (not (contains? (:data json-resp) :pandas)))))
+
+  (testing "Mixed-type query routes columns into the correct buckets"
+    ;; mt/user-http-request decodes JSON map keys as keywords, so dtype keys arrive as keywords
+    ;; here even though they're strings on the wire.
+    (let [resp (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                     {:database_id (mt/id)
+                                      :sql         (str "SELECT CAST(1 AS INTEGER) AS i, "
+                                                        "CAST(1.5 AS DOUBLE) AS f, "
+                                                        "'x' AS t, "
+                                                        "TRUE AS b, "
+                                                        "DATE '2026-01-01' AS d, "
+                                                        "CAST('2026-01-01 12:00:00' AS TIMESTAMP) AS dt")
+                                      :format      "csv"})
+          {:keys [dtype parse_dates]} (get-in resp [:data :pandas])
+          parse-set (set (map name parse_dates))]
+      (is (= "Int64"   (:I dtype)))
+      (is (= "Float64" (:F dtype)))
+      (is (= "string"  (:T dtype)))
+      (is (= "boolean" (:B dtype)))
+      (is (contains? parse-set "D")  "DATE column should be in parse_dates")
+      (is (contains? parse-set "DT") "TIMESTAMP column should be in parse_dates")
+      (is (not (contains? dtype :D)))
+      (is (not (contains? dtype :DT)))))
+
+  (testing "data.pandas is splat-shaped — keys match pd.read_csv kwargs (dtype, parse_dates)"
+    (let [resp (mt/user-http-request :crowberto :post 200 "agent/v1/native"
+                                     {:database_id (mt/id)
+                                      :sql         "SELECT 1 AS x"
+                                      :format      "csv"})]
+      ;; Consumer pattern is `pd.read_csv(io.StringIO(data['csv']), **data['pandas'])` — so the
+      ;; only top-level keys here must be valid read_csv kwarg names.
+      (is (= #{:dtype :parse_dates}
+             (set (keys (get-in resp [:data :pandas]))))))))
+
 (deftest get-card-parameter-values-test
   (mt/with-temp
     [:model/Card {card-id :id}

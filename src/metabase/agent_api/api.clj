@@ -66,7 +66,7 @@
 (def ^:private ^:const json-soft-limit 200)
 (def ^:private ^:const json-hard-limit 500)
 (def ^:private ^:const csv-soft-limit  500)
-(def ^:private ^:const csv-hard-limit  2000)
+(def ^:private ^:const csv-hard-limit  10000)
 
 ;;; ---------------------------------------------------- Helpers ------------------------------------------------------
 
@@ -832,12 +832,47 @@
     (data.csv/write-csv sw (cons header body))
     (.toString sw)))
 
+(defn- col->pandas-disposition
+  "Map a Metabase base_type (as a string) to either `:parse-date` (the col belongs in
+   pd.read_csv's parse_dates) or a pandas dtype string. Uses Metabase's `isa?` type hierarchy
+   so descendants (e.g. type/CreationTimestamp, type/Currency, type/UUID) are handled implicitly."
+  [base-type-str]
+  (let [k (keyword base-type-str)]
+    (cond
+      (or (isa? k :type/Date)
+          (isa? k :type/DateTime)
+          (isa? k :type/Instant))   :parse-date
+      (isa? k :type/Time)           "string"
+      (isa? k :type/Integer)        "Int64"
+      (isa? k :type/Number)         "Float64"
+      (isa? k :type/Boolean)        "boolean"
+      (isa? k :type/Text)           "string"
+      :else                         "string")))
+
+(defn- cols->pandas-kwargs
+  "Build a kwargs dict for pd.read_csv from trimmed cols. Shape is exactly
+     {:dtype       {<col-name> <pandas-dtype>}
+      :parse_dates [<col-name> ...]}
+   so consumers can splat: pd.read_csv(io.StringIO(csv), **data['pandas'])."
+  [trimmed-cols]
+  (reduce (fn [acc {col-name :name base-type :base_type}]
+            (let [d (col->pandas-disposition base-type)]
+              (if (= d :parse-date)
+                (update acc :parse_dates conj col-name)
+                (assoc-in acc [:dtype col-name] d))))
+          {:dtype {} :parse_dates []}
+          trimmed-cols))
+
 (defn- slim-response
   "Trim a QP result map to the lean execute_* response shape, encoding rows as CSV when requested.
 
    - `format`: `:csv` (default) or `:json`
    - `cap`:    effective row cap; we received up to `cap + 1` rows from the QP so we can detect
                whether more data existed.
+
+   When format=:csv, also includes data.pandas — a kwargs dict for pd.read_csv so consumers can
+   produce a properly-typed DataFrame in one line:
+     pd.read_csv(io.StringIO(data['csv']), **data['pandas'])
 
    Drops Metabase internals not useful to LLM consumers (cached, database_id, json_query,
    average_execution_time, context, native_form, results_metadata, results_timezone, format-rows?,
@@ -852,7 +887,8 @@
         rows      (if truncated? (subvec all-rows 0 cap) all-rows)
         cols      (mapv trim-col (or (:cols result-data) []))
         data      (cond-> {:cols cols}
-                    (= format :csv)  (assoc :csv (rows->csv cols rows))
+                    (= format :csv)  (assoc :csv    (rows->csv cols rows)
+                                            :pandas (cols->pandas-kwargs cols))
                     (= format :json) (assoc :rows rows))]
     (cond-> {:status    (or status :completed)
              :row_count (if truncated? cap (or result-row-count (count rows)))
@@ -873,7 +909,7 @@
              :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
     [:maybe [:enum "csv" "json"]]]
    [:limit  {:optional true
-             :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped."}
+             :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 10000 (csv). Higher values are clamped."}
     [:maybe ms/PositiveInt]]])
 
 (mr/def ::column-metadata
@@ -884,13 +920,15 @@
    [:base_type    :string]])
 
 (mr/def ::execute-query-response
-  "Slim response from execute_* tools. The HTTP status is always 202 because results stream —
-   check the `status` field to determine success or failure.
+  "Slim response from execute_* tools.
 
    When format=\"csv\" (default), rows live in data.csv as a single RFC 4180 CSV string with a
-   header row of column names; data.rows is omitted. When format=\"json\", data.rows is the array
-   of arrays and data.csv is omitted. data.cols is always present so consumers can build a pandas
-   dtype map keyed by name.
+   header row of column names, and data.pandas is a kwargs dict for pd.read_csv (splat it with
+   `**data['pandas']` to get a properly-typed DataFrame). data.rows is omitted in this format.
+
+   When format=\"json\", data.rows is the array of arrays and data.csv/data.pandas are omitted.
+
+   data.cols is always present.
 
    `truncated` is true when more rows existed than were returned (either the cap kicked in or the
    user-supplied limit was clamped down to the format's hard maximum)."
@@ -902,9 +940,13 @@
    [:started_at   {:optional true} :any]
    [:data         {:optional true}
     [:map
-     [:cols [:sequential ::column-metadata]]
-     [:rows {:optional true} [:sequential [:sequential :any]]]
-     [:csv  {:optional true} :string]]]
+     [:cols   [:sequential ::column-metadata]]
+     [:rows   {:optional true} [:sequential [:sequential :any]]]
+     [:csv    {:optional true} :string]
+     [:pandas {:optional true}
+      [:map
+       [:dtype       [:map-of :string :string]]
+       [:parse_dates [:sequential :string]]]]]]
    [:error        {:optional true} :string]])
 
 (mr/def ::query-response
@@ -932,7 +974,7 @@
   returning results with slim column metadata. Default response format is CSV (data.csv); pass
   format=\"json\" to get arrays of arrays under data.rows instead.
 
-  Row caps are format-aware: 200 default / 500 max for json, 500 default / 2000 max for csv.
+  Row caps are format-aware: 200 default / 500 max for json, 500 default / 10000 max for csv.
   When more rows existed than were returned, `truncated` is true."
   {:scope "agent:query:execute"
    :tool  {:name "execute_query"
@@ -940,13 +982,17 @@
                              "row count, and execution time.\n\n"
                              "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
                              "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
-                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
-                             "dtype map keyed by name.\n\n"
+                             "data.cols always includes {name, display_name, base_type}.\n\n"
                              "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
-                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "rows (max 10000). The optional `limit` param is clamped to the format's hard maximum. "
                              "When more rows existed than were returned, the response sets truncated=true.\n\n"
                              "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
-                             "when format=\"csv\".")}}
+                             "when format=\"csv\".\n\n"
+                             "When format=\"csv\", data.pandas is a kwargs dict for pd.read_csv — splat it to get a "
+                             "properly-typed DataFrame in one line:\n"
+                             "  df = pd.read_csv(io.StringIO(data['csv']), **data['pandas'])\n"
+                             "data.pandas.dtype covers numeric/text/boolean cols; data.pandas.parse_dates lists "
+                             "the temporal cols.")}}
   [_route-params
    _query-params
    {encoded-query :query format :format limit :limit} :- ::execute-query-request]
@@ -1060,7 +1106,7 @@
              :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
     [:maybe [:enum "csv" "json"]]]
    [:limit {:optional true
-            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped and truncated=true is set."}
+            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 10000 (csv). Higher values are clamped and truncated=true is set."}
     [:maybe ms/PositiveInt]]])
 
 (mr/def ::execute-card-request
@@ -1073,7 +1119,7 @@
              :tool/description "Response row format: \"csv\" (default) packs rows into a single RFC 4180 CSV string under data.csv. \"json\" returns rows as arrays of arrays under data.rows."}
     [:maybe [:enum "csv" "json"]]]
    [:limit {:optional true
-            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 2000 (csv). Higher values are clamped and truncated=true is set."}
+            :tool/description "Row cap. Defaults to 200 (json) or 500 (csv); hard maximum is 500 (json) or 10000 (csv). Higher values are clamped and truncated=true is set."}
     [:maybe ms/PositiveInt]]])
 
 ;;; Helpers ---------------------------------------------------------------------------------------
@@ -1277,20 +1323,24 @@
 
    Returns slim, materialized results suitable for LLM context. Default response format is CSV
    (data.csv); pass format=\"json\" to get arrays of arrays under data.rows instead. Row caps are
-   format-aware: json defaults to 200 (max 500), csv defaults to 500 (max 2000)."
+   format-aware: json defaults to 200 (max 500), csv defaults to 500 (max 10000)."
   {:scope "agent:query:execute"
    :tool  {:name "execute_card"
            :description (str "Execute a saved question or model by id with optional parameter bindings. "
                              "Use get_card first to discover the parameters.\n\n"
                              "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
                              "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
-                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
-                             "dtype map keyed by name.\n\n"
+                             "data.cols always includes {name, display_name, base_type}.\n\n"
                              "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
-                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "rows (max 10000). The optional `limit` param is clamped to the format's hard maximum. "
                              "When more rows existed than were returned, the response sets truncated=true.\n\n"
                              "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
-                             "when format=\"csv\".")}}
+                             "when format=\"csv\".\n\n"
+                             "When format=\"csv\", data.pandas is a kwargs dict for pd.read_csv — splat it to get a "
+                             "properly-typed DataFrame in one line:\n"
+                             "  df = pd.read_csv(io.StringIO(data['csv']), **data['pandas'])\n"
+                             "data.pandas.dtype covers numeric/text/boolean cols; data.pandas.parse_dates lists "
+                             "the temporal cols.")}}
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]
    _query-params
    {:keys [parameters format limit]} :- ::execute-card-request]
@@ -1315,7 +1365,7 @@
    Gated by the current user's native query permissions on the target database (the same gate used
    by Metabase's built-in native SQL editor). Default response format is CSV (data.csv); pass
    format=\"json\" to get arrays of arrays under data.rows instead. Row caps are format-aware: json
-   defaults to 200 (max 500), csv defaults to 500 (max 2000)."
+   defaults to 200 (max 500), csv defaults to 500 (max 10000)."
   {:scope "agent:query:execute"
    :tool  {:name "execute_native_query"
            :description (str "Execute an ad-hoc native SQL query against a Metabase database. "
@@ -1324,13 +1374,17 @@
                              "Prefer execute_card for trusted, reusable queries.\n\n"
                              "Response format is controlled by the `format` param: \"csv\" (default) returns rows as a "
                              "single RFC 4180 CSV string under data.csv; \"json\" returns rows as arrays under data.rows. "
-                             "data.cols always includes {name, display_name, base_type} so you can build a pandas "
-                             "dtype map keyed by name.\n\n"
+                             "data.cols always includes {name, display_name, base_type}.\n\n"
                              "Row caps are format-aware: json defaults to 200 rows (max 500), csv defaults to 500 "
-                             "rows (max 2000). The optional `limit` param is clamped to the format's hard maximum. "
+                             "rows (max 10000). The optional `limit` param is clamped to the format's hard maximum. "
                              "When more rows existed than were returned, the response sets truncated=true.\n\n"
                              "BREAKING: clients reading data.rows must check `format` first — it lives in data.csv "
-                             "when format=\"csv\".")}}
+                             "when format=\"csv\".\n\n"
+                             "When format=\"csv\", data.pandas is a kwargs dict for pd.read_csv — splat it to get a "
+                             "properly-typed DataFrame in one line:\n"
+                             "  df = pd.read_csv(io.StringIO(data['csv']), **data['pandas'])\n"
+                             "data.pandas.dtype covers numeric/text/boolean cols; data.pandas.parse_dates lists "
+                             "the temporal cols.")}}
   [_route-params
    _query-params
    {:keys [database_id sql template_tags parameters format limit]} :- ::native-query-request]
