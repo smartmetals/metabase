@@ -186,7 +186,7 @@
       (is (= 200 (:status post-response))))))
 
 (deftest tools-list-test
-  (testing "tools/list returns the 8 agent tools"
+  (testing "tools/list returns the 14 agent tools (8 upstream + 6 fork card/database/native tools)"
     (let [[session-id _] (initialize!)
           response (mcp-request (jsonrpc-request "tools/list")
                                 {"mcp-session-id" session-id})
@@ -194,7 +194,10 @@
       (is (= 200 (:status response)))
       (is (pos? (count tools)))
       (is (= #{"search" "get_table" "get_metric" "get_table_field_values"
-               "get_metric_field_values" "construct_query" "execute_query" "query"}
+               "get_metric_field_values" "construct_query" "execute_query" "query"
+               ;; fork additions
+               "search_cards" "list_databases" "get_card" "get_card_parameter_values"
+               "execute_card" "execute_native_query"}
              (set (map :name tools))))
       (testing "each tool has a description and inputSchema"
         (doseq [tool tools]
@@ -457,22 +460,23 @@
             "with-fields=false should return no fields")))))
 
 (deftest tools-call-execute-query-test
-  (testing "execute_query returns a streaming response captured as MCP text content"
-    (let [streamed? (atom false)
-          original-fn       (mt/original-fn #'mcp.tools/capture-streaming-response)]
-      (mt/with-dynamic-fn-redefs [mcp.tools/capture-streaming-response
-                                  (fn [response]
-                                    (reset! streamed? true)
-                                    (original-fn response))]
-        (let [[session-id _] (initialize!)
-              construct-data (call-tool session-id "construct_query" {:table_id (mt/id :orders) :limit 5})
-              execute-data   (call-tool session-id "execute_query"   {:query (:query construct-data)})]
-          (is (true? @streamed?) "execute_query should use the streaming response path")
-          (is (=? {:status    "completed"
-                   :row_count 5
-                   :data      {:cols sequential?
-                               :rows (fn [rows] (= 5 (count rows)))}}
-                  execute-data)))))))
+  ;; This fork's execute_query returns a materialized slim response (CSV by default, JSON on request) rather than
+  ;; upstream's streaming response.
+  (testing "execute_query returns a materialized response captured as MCP text content"
+    (let [[session-id _] (initialize!)
+          construct-data (call-tool session-id "construct_query" {:table_id (mt/id :orders) :limit 5})]
+      (testing "default (csv) format"
+        (is (=? {:status    "completed"
+                 :row_count 5
+                 :data      {:cols sequential?
+                             :csv  string?}}
+                (call-tool session-id "execute_query" {:query (:query construct-data)}))))
+      (testing "json format"
+        (is (=? {:status    "completed"
+                 :row_count 5
+                 :data      {:cols sequential?
+                             :rows (fn [rows] (= 5 (count rows)))}}
+                (call-tool session-id "execute_query" {:query (:query construct-data) :format "json"})))))))
 
 ;;; --------------------------------------------- OAuth Bearer Auth -------------------------------------------------
 
@@ -552,7 +556,7 @@
 (deftest tools-list-scope-filtering-test
   (testing "tools/list with unrestricted scopes returns all tools"
     (let [tools (mcp.tools/list-tools #{::scope/unrestricted})]
-      (is (= 8 (count tools)))))
+      (is (= 14 (count tools)))))
   (testing "tools/list with specific scope only returns matching tools"
     (let [tools     (mcp.tools/list-tools #{"agent:search"})
           tool-names (set (map :name tools))]
@@ -563,10 +567,10 @@
       (is (not (contains? tool-names "construct_query")))))
   (testing "tools/list with wildcard scope matches all agent tools"
     (let [tools (mcp.tools/list-tools #{"agent:*"})]
-      (is (= 8 (count tools)))))
+      (is (= 14 (count tools)))))
   (testing "tools/list with nil scopes returns all tools"
     (let [tools (mcp.tools/list-tools nil)]
-      (is (= 8 (count tools)))))
+      (is (= 14 (count tools)))))
   (testing "tools/list with empty scopes does not return all tools"
     (let [tools (mcp.tools/list-tools #{})]
       (is (zero? (count tools))

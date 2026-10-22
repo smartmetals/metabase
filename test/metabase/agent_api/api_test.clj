@@ -407,8 +407,9 @@
                            (assoc :info {:card-id card-id})
                            json/encode
                            u/encode-base64)]
+            ;; this fork's /v1/execute returns a materialized (non-streaming) response, hence 200 rather than 202
             (is (=? {:status "completed"}
-                    (mt/user-http-request :rasta :post 202 "agent/v1/execute" {:query forged})))
+                    (mt/user-http-request :rasta :post 200 "agent/v1/execute" {:query forged})))
             (is (= ["SECRET"]
                    (map :name (t2/select-one-fn :result_metadata :model/Card :id card-id))))))))))
 
@@ -798,6 +799,46 @@
                                        {:parameters [{:id "tag-n" :type "number/=" :value 42}]
                                         :format     "json"})]
         (is (=? {:status "completed" :row_count 1 :data {:rows [[42]]}} resp))))))
+
+(deftest execute-card-rejects-object-valued-parameter-sql-injection-test
+  ;; Same payloads as upstream's CVE-2026-72899 regression test for public cards: a map/HoneySQL-shaped parameter
+  ;; value must never be spliced into SQL. execute_card accepts free-form parameter maps, so make sure upstream's
+  ;; parameter-value normalization neutralizes them on this path too.
+  (testing "POST /api/agent/v1/card/:id/execute"
+    (mt/with-temp [:model/Card {card-id :id}
+                   {:name          "AgentExecuteCardInjectionTest"
+                    :type          :question
+                    :database_id   (mt/id)
+                    :dataset_query {:type     :native
+                                    :database (mt/id)
+                                    :native   {:query         "SELECT count(*) AS c FROM venues WHERE {{price}}"
+                                               :template-tags {"price" {:id           "_PRICE_"
+                                                                        :name         "price"
+                                                                        :display-name "Price"
+                                                                        :type         :dimension
+                                                                        :dimension    [:field (mt/id :venues :price) nil]
+                                                                        :widget-type  :category
+                                                                        :required     true}}}}
+                    :parameters    [{:id     "_PRICE_"
+                                     :name   "price"
+                                     :slug   "price"
+                                     :type   "category"
+                                     :target [:dimension [:template-tag "price"]]}]}]
+      (letfn [(run [value]
+                (mt/user-http-request :crowberto :post (str "agent/v1/card/" card-id "/execute")
+                                      {:parameters [{:id     "_PRICE_"
+                                                     :type   "category"
+                                                     :target [:dimension [:template-tag "price"]]
+                                                     :value  value}]
+                                       :format     "json"}))]
+        (testing "sanity check: a scalar value works"
+          (is (=? {:status "completed" :data {:rows [[22]]}} (run 1))))
+        (doseq [[label evil-value] [["raw map"        {:raw "1) UNION SELECT 1 -- "}]
+                                    ["map inside vec" [{:raw "1) UNION SELECT 1 -- "}]]
+                                    ["honeysql vec"   [["raw" "1) UNION SELECT 1 -- "]]]]]
+          (testing label
+            (is (not= "completed" (:status (run evil-value)))
+                "an object-valued parameter must not run as SQL")))))))
 
 (deftest execute-native-query-test
   (testing "Default (csv) format returns slim shape"

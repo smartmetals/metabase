@@ -786,12 +786,13 @@
   encoded `:query`, a continuation token) could carry a native query — legacy top-level `:type :native`
   or an MBQL 5 native stage; allowing either would let a token without the SQL-execution scope run
   raw SQL, defeating the scope split and bypassing the execute-sql kill switch. Force native
-  execution onto `/v1/execute-sql`, which is correctly scoped."
+  execution onto `/v1/execute-sql`, which is correctly scoped. (In this fork, native SQL goes through
+  `/v1/native` / `execute_native_query` instead.)"
   [query-map]
   (when (some-> (u/ignore-exceptions (lib-be/normalize-query query-map))
                 not-empty
                 lib/any-native-stage?)
-    (throw (ex-info "Native queries are not supported here; use execute_sql instead."
+    (throw (ex-info "Native queries are not supported here; use execute_native_query instead."
                     {:status-code 400}))))
 
 (defn- validate-serialized-query!
@@ -1476,8 +1477,9 @@
         run-fn  (fn [qp _export-format]
                   (fn [query info]
                     (qp (update query :info merge info) qp.reducible/default-rff)))
+        ;; v0.60.27: `process-query-for-card` takes the Card itself (and read-checks it), not its id.
         result  (qp.card/process-query-for-card
-                 id :api
+                 (api/check-404 (t2/select-one :model/Card :id id)) :api
                  :parameters  parameters
                  :context     :question
                  :constraints (execution-constraints cap)
