@@ -2,7 +2,8 @@
 # STAGE 1: builder
 ###################
 
-FROM node:22-bullseye AS builder
+# Build natively on the host platform: the uberjar is arch-independent, and bun segfaults under QEMU emulation
+FROM --platform=$BUILDPLATFORM node:22-bookworm AS builder
 
 ARG MB_EDITION=oss
 ARG VERSION

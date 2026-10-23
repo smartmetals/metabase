@@ -1,3 +1,12 @@
+> **Fork build:** build and push the Docker image with
+>
+> ```bash
+> docker buildx build --platform linux/amd64 --build-arg VERSION=v0.60.27 -t ghcr.io/smartmetals/metabase:v0.60.27-native .
+> docker push ghcr.io/smartmetals/metabase:v0.60.27-native
+> ```
+>
+> `VERSION` is required. The Docker VM needs ~16 GiB of memory (e.g. `colima start --cpu 8 --memory 16`) or the frontend build is OOM-killed.
+
 # Metabase
 
 [Metabase](https://www.metabase.com) is the easy, open-source way for everyone in your company to ask questions and learn from data.
